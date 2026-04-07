@@ -1230,8 +1230,118 @@ function renderStats(){
 }
 
 // ══════════════════════════════════════════
+// SUPABASE — SYNC TEMPS RÉEL
+// ══════════════════════════════════════════
+const SB_URL = 'https://kgzdcjiobfdriodlcqkp.supabase.co';
+const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtnemRjamlvYmZkcmlvZGxjcWtwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU1Nzg2MjIsImV4cCI6MjA5MTE1NDYyMn0.hVFm6Oa39y0k4G8JrsU2OreQ-67qQRTJ5yV3j9zAvjQ';
+const SB_TABLE = 'lj_data';
+let lastRemoteUpdate = null;
+let syncInProgress = false;
+
+async function sbFetch(method, body=null){
+  const opts = {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SB_KEY,
+      'Authorization': 'Bearer ' + SB_KEY,
+      'Prefer': method==='POST' ? 'resolution=merge-duplicates,return=minimal' : ''
+    }
+  };
+  if(body) opts.body = JSON.stringify(body);
+  const url = `${SB_URL}/rest/v1/${SB_TABLE}?id=eq.1`;
+  return fetch(method==='GET' ? `${SB_URL}/rest/v1/${SB_TABLE}?select=*` : url, opts);
+}
+
+async function pushToSupabase(){
+  if(syncInProgress) return;
+  syncInProgress = true;
+  setSyncDot('spin');
+  try {
+    const cu = associes.find(a=>a.id===currentUserId);
+    const payload = {
+      id: 1,
+      data: JSON.stringify({bookings, guestProfiles, properties, associes, notifs}),
+      updated_at: new Date().toISOString(),
+      updated_by: cu?.name || 'Inconnu'
+    };
+    // Try PATCH first, then POST if not exists
+    const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?id=eq.1`, {
+      method: 'PATCH',
+      headers: {'Content-Type':'application/json','apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY,'Prefer':'return=minimal'},
+      body: JSON.stringify(payload)
+    });
+    if(r.status === 404 || r.status === 406) {
+      await fetch(`${SB_URL}/rest/v1/${SB_TABLE}`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json','apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY,'Prefer':'return=minimal'},
+        body: JSON.stringify(payload)
+      });
+    }
+    lastRemoteUpdate = payload.updated_at;
+    setSyncDot('ok');
+    saveLocal();
+  } catch(e) {
+    setSyncDot('');
+    console.warn('Sync error:', e);
+  }
+  syncInProgress = false;
+}
+
+async function pullFromSupabase(){
+  if(syncInProgress) return;
+  try {
+    setSyncDot('spin');
+    const r = await fetch(`${SB_URL}/rest/v1/${SB_TABLE}?select=*&order=updated_at.desc&limit=1`, {
+      headers: {'apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY}
+    });
+    if(!r.ok){setSyncDot('');return;}
+    const rows = await r.json();
+    if(!rows || !rows.length){setSyncDot('ok');return;}
+    const row = rows[0];
+    // Only update if remote is newer than what we last pushed
+    if(lastRemoteUpdate && row.updated_at <= lastRemoteUpdate){setSyncDot('ok');return;}
+    // Only update if it was changed by someone else
+    const cu = associes.find(a=>a.id===currentUserId);
+    if(row.updated_by === cu?.name){setSyncDot('ok');return;}
+    const d = JSON.parse(row.data);
+    bookings = d.bookings || bookings;
+    guestProfiles = d.guestProfiles || guestProfiles;
+    properties = d.properties || properties;
+    associes = d.associes || associes;
+    notifs = d.notifs || notifs;
+    lastRemoteUpdate = row.updated_at;
+    saveLocal();
+    renderHome(); renderBooks(); renderGuests(); renderProps(); renderUserPill(); updateBadge();
+    const t = new Date(row.updated_at).toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'});
+    toast(`🔄 Sync avec ${row.updated_by} à ${t}`);
+    setSyncDot('ok');
+  } catch(e) {
+    setSyncDot('');
+  }
+}
+
+// Override saveLocal to also push to Supabase
+const _saveLocal = saveLocal;
+function saveAndSync(){
+  _saveLocal();
+  pushToSupabase();
+}
+
+// ══════════════════════════════════════════
 // INIT
 // ══════════════════════════════════════════
+async function createTableIfNeeded(){
+  // Try to insert initial row — Supabase will ignore if already exists
+  try {
+    await fetch(`${SB_URL}/rest/v1/${SB_TABLE}`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','apikey':SB_KEY,'Authorization':'Bearer '+SB_KEY,'Prefer':'return=minimal,resolution=ignore-duplicates'},
+      body: JSON.stringify({id:1, data:'{}', updated_at: new Date().toISOString(), updated_by:'init'})
+    });
+  } catch(e){}
+}
+
 function initCal(){const d=new Date();calY=d.getFullYear();calM=d.getMonth();}
 
 loadLocal();
@@ -1247,10 +1357,22 @@ addNotif('📱 Application démarrée — Location José v5');
 bookings.filter(b=>{const d=untilD(b.checkIn);return d>=0&&d<=7&&(b.status==='confirmed'||b.status==='pending');}).forEach(b=>addNotif(`📅 Arrivée dans ${untilD(b.checkIn)}j — ${b.guestName} · ${b.property}`));
 bookings.filter(b=>b.depositStatus==='pending').forEach(b=>addNotif(`⚠️ Caution en attente — ${b.guestName} (${b.deposit||0}€)`));
 updateBadge();
-setSyncDot('ok');
+setSyncDot('spin');
 
-// Auto-save every 30s
-setInterval(()=>{saveLocal();setSyncDot('ok');},30000);
+// Override all saveLocal calls to also sync
+document.querySelectorAll('*');
+const origSaveLocal = saveLocal;
+window.saveLocal = function(){origSaveLocal();pushToSupabase();};
+
+// Initial sync
+createTableIfNeeded().then(()=>{
+  pullFromSupabase().then(()=>{
+    pushToSupabase();
+  });
+});
+
+// Pull every 10 seconds
+setInterval(pullFromSupabase, 10000);
 
 // Close overlays
 ['ov-detail','ov-new','ov-prop','ov-assoc','ov-guest'].forEach(id=>{
